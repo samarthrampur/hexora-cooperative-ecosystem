@@ -1,0 +1,607 @@
+// Prisma Schema for HEXORA Unified Ecosystem
+// Problem Statement ID: SIH26087
+// Supports SQLite for instant local zero-config launch and easily switches to PostgreSQL
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ==========================================
+// 1. IDENTITY, AUTHENTICATION & CORE ROLES
+// ==========================================
+
+model User {
+  id                String             @id @default(uuid())
+  email             String             @unique
+  passwordHash      String
+  fullName          String
+  phone             String?
+  avatarUrl         String?
+  intendedRole      String             @default("LEARNER") // LEARNER, COOPERATIVE_MEMBER, COOPERATIVE_ADMIN, TRAINER, JOB_SEEKER, EMPLOYER, SUPER_ADMIN
+  activeWorkspace   String             @default("LMS") // LMS, ERP, EMPLOYMENT
+  hasSelectedPurpose Boolean           @default(false)
+  isEmailVerified   Boolean            @default(true)
+  createdAt         DateTime           @default(now())
+  updatedAt         DateTime           @updatedAt
+
+  // Relationships
+  userRoles         UserRole[]
+  workspaceAccess   WorkspaceAccess[]
+  notifications     Notification[]
+  auditLogs         AuditLog[]
+  aiInteractions    AIInteraction[]
+
+  // LMS Relations
+  instructorCourses Course[]           @relation("InstructorCourses")
+  enrollments       CourseEnrollment[]
+  submissions       AssessmentSubmission[]
+  certificates      Certificate[]
+  lessonProgresses  LessonProgress[]
+
+  // ERP Relations
+  cooperativeMemberships Member[]      @relation("UserMemberships")
+  createdTasks      Task[]             @relation("CreatedTasks")
+  financialEntries  FinancialRecord[]  @relation("RecordedFinancials")
+  uploadedDocuments Document[]         @relation("UploadedDocs")
+
+  // Employment Relations
+  candidateProfile  CandidateProfile?
+  employerProfile   Employer?
+}
+
+model Role {
+  id          String     @id @default(uuid())
+  name        String     @unique // SUPER_ADMIN, COOPERATIVE_ADMIN, COOPERATIVE_MEMBER, LEARNER, TRAINER, JOB_SEEKER, EMPLOYER
+  description String?
+  userRoles   UserRole[]
+}
+
+model UserRole {
+  id        String   @id @default(uuid())
+  userId    String
+  roleId    String
+  createdAt DateTime @default(now())
+
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role      Role     @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, roleId])
+}
+
+model WorkspaceAccess {
+  id        String   @id @default(uuid())
+  userId    String
+  workspace String   // LMS, ERP, EMPLOYMENT
+  grantedAt DateTime @default(now())
+
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, workspace])
+}
+
+model Notification {
+  id        String   @id @default(uuid())
+  userId    String
+  title     String
+  message   String
+  type      String   @default("INFO") // INFO, SUCCESS, WARNING, ALERT
+  isRead    Boolean  @default(false)
+  link      String?
+  createdAt DateTime @default(now())
+
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model AuditLog {
+  id        String   @id @default(uuid())
+  userId    String?
+  action    String
+  entity    String
+  details   String?
+  ipAddress String?
+  createdAt DateTime @default(now())
+
+  user      User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+}
+
+// ==========================================
+// 2. LEARNING MANAGEMENT SYSTEM (LMS)
+// ==========================================
+
+model CourseCategory {
+  id          String   @id @default(uuid())
+  name        String   @unique
+  slug        String   @unique
+  description String?
+  icon        String?
+  courses     Course[]
+}
+
+model Course {
+  id             String          @id @default(uuid())
+  title          String
+  slug           String          @unique
+  thumbnail      String?
+  description    String
+  categoryId     String
+  difficulty     String          @default("BEGINNER") // BEGINNER, INTERMEDIATE, ADVANCED
+  instructorId   String
+  durationHours  Float           @default(1.0)
+  objectives     String?         // Stored as JSON or delimited string
+  status         String          @default("PUBLISHED") // DRAFT, PUBLISHED, ARCHIVED
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+
+  category       CourseCategory  @relation(fields: [categoryId], references: [id])
+  instructor     User            @relation("InstructorCourses", fields: [instructorId], references: [id])
+  lessons        Lesson[]
+  assessments    Assessment[]
+  enrollments    CourseEnrollment[]
+  certificates   Certificate[]
+  courseSkills   CourseSkill[]
+  trainingAssignments CooperativeTrainingAssignment[]
+}
+
+model Lesson {
+  id             String           @id @default(uuid())
+  courseId       String
+  title          String
+  orderIndex     Int              @default(1)
+  contentType    String           @default("VIDEO") // VIDEO, TEXT, PDF, RESOURCE
+  contentUrl     String?
+  contentBody    String?
+  durationMinutes Int             @default(10)
+  isFreePreview  Boolean          @default(false)
+
+  course         Course           @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  progresses     LessonProgress[]
+}
+
+model LessonProgress {
+  id          String    @id @default(uuid())
+  userId      String
+  lessonId    String
+  isCompleted Boolean   @default(false)
+  completedAt DateTime?
+
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  lesson      Lesson    @relation(fields: [lessonId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, lessonId])
+}
+
+model CourseEnrollment {
+  id              String    @id @default(uuid())
+  userId          String
+  courseId        String
+  enrolledAt      DateTime  @default(now())
+  progressPercent Float     @default(0.0)
+  isCompleted     Boolean   @default(false)
+  completedAt     DateTime?
+
+  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  course          Course    @relation(fields: [courseId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, courseId])
+}
+
+model Assessment {
+  id               String                 @id @default(uuid())
+  courseId         String
+  title            String
+  description      String?
+  passingScore     Int                    @default(70)
+  timeLimitMinutes Int                    @default(20)
+
+  course           Course                 @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  questions        AssessmentQuestion[]
+  submissions      AssessmentSubmission[]
+}
+
+model AssessmentQuestion {
+  id            String     @id @default(uuid())
+  assessmentId  String
+  questionText  String
+  questionType  String     @default("MULTIPLE_CHOICE") // MULTIPLE_CHOICE, TRUE_FALSE
+  optionsJson   String     // JSON array of strings
+  correctAnswer String
+  points        Int        @default(1)
+
+  assessment    Assessment @relation(fields: [assessmentId], references: [id], onDelete: Cascade)
+}
+
+model AssessmentSubmission {
+  id           String     @id @default(uuid())
+  assessmentId String
+  userId       String
+  answersJson  String     // JSON object of questionId -> selectedAnswer
+  score        Float
+  passed       Boolean
+  feedback     String?
+  submittedAt  DateTime   @default(now())
+
+  assessment   Assessment @relation(fields: [assessmentId], references: [id], onDelete: Cascade)
+  user         User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model Certificate {
+  id                String   @id @default(uuid())
+  certificateNumber String   @unique // e.g. HEX-CERT-2026-XXXX
+  userId            String
+  courseId          String
+  issuedAt          DateTime @default(now())
+  issuingOrg        String   @default("HEXORA Cooperative Academy")
+  grade             String   @default("PASS")
+  skillsCredited    String?  // JSON array of verified skills
+
+  user              User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  course            Course   @relation(fields: [courseId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, courseId])
+}
+
+model Skill {
+  id              String           @id @default(uuid())
+  name            String           @unique
+  category        String           @default("GENERAL") // TECHNICAL, MANAGEMENT, VOCATIONAL, AGRICULTURAL
+  description     String?
+
+  courseSkills    CourseSkill[]
+  candidateSkills CandidateSkill[]
+  jobSkills       JobSkill[]
+}
+
+model CourseSkill {
+  id       String @id @default(uuid())
+  courseId String
+  skillId  String
+
+  course   Course @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  skill    Skill  @relation(fields: [skillId], references: [id], onDelete: Cascade)
+
+  @@unique([courseId, skillId])
+}
+
+// ==========================================
+// 3. COOPERATIVE ERP
+// ==========================================
+
+model Cooperative {
+  id                 String             @id @default(uuid())
+  name               String
+  registrationNumber String             @unique
+  type               String             @default("MULTIPURPOSE") // AGRICULTURE, CREDIT, HANDICRAFT, HOUSING, DAIRY, MULTIPURPOSE
+  address            String?
+  city               String?
+  state              String?
+  contactEmail       String?
+  contactPhone       String?
+  description        String?
+  establishedDate    DateTime?
+  status             String             @default("ACTIVE") // ACTIVE, PENDING, SUSPENDED
+  logoUrl            String?
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
+
+  members            Member[]
+  departments        Department[]
+  designations       Designation[]
+  tasks              Task[]
+  attendanceRecords  AttendanceRecord[]
+  meetings           Meeting[]
+  financialRecords   FinancialRecord[]
+  documents          Document[]
+  hardwareDevices    HardwareDevice[]
+  trainingAssignments CooperativeTrainingAssignment[]
+}
+
+model Member {
+  id               String             @id @default(uuid())
+  cooperativeId    String
+  userId           String
+  membershipId     String             @unique // e.g. MEM-001
+  designation      String             @default("Member")
+  departmentId     String?
+  joinDate         DateTime           @default(now())
+  status           String             @default("ACTIVE") // ACTIVE, INACTIVE, SUSPENDED
+  emergencyContact String?
+
+  cooperative      Cooperative        @relation(fields: [cooperativeId], references: [id], onDelete: Cascade)
+  user             User               @relation("UserMemberships", fields: [userId], references: [id], onDelete: Cascade)
+  department       Department?        @relation(fields: [departmentId], references: [id])
+  assignedTasks    Task[]             @relation("AssignedMemberTasks")
+  attendanceLogs   AttendanceRecord[]
+  trainingAssignments CooperativeTrainingAssignment[]
+
+  @@unique([cooperativeId, userId])
+}
+
+model Department {
+  id            String       @id @default(uuid())
+  cooperativeId String
+  name          String
+  description   String?
+  headMemberId  String?
+
+  cooperative   Cooperative  @relation(fields: [cooperativeId], references: [id], onDelete: Cascade)
+  members       Member[]
+}
+
+model Designation {
+  id               String       @id @default(uuid())
+  cooperativeId    String
+  title            String
+  level            Int          @default(1)
+  responsibilities String?
+
+  cooperative      Cooperative  @relation(fields: [cooperativeId], references: [id], onDelete: Cascade)
+}
+
+model Task {
+  id                 String       @id @default(uuid())
+  cooperativeId      String
+  title              String
+  description        String?
+  priority           String       @default("MEDIUM") // LOW, MEDIUM, HIGH, URGENT
+  status             String       @default("PENDING") // PENDING, IN_PROGRESS, COMPLETED, CANCELLED
+  assignedToMemberId String?
+  createdByUserId    String
+  dueDate            DateTime?
+  completedAt        DateTime?
+  createdAt          DateTime     @default(now())
+  updatedAt          DateTime     @updatedAt
+
+  cooperative        Cooperative  @relation(fields: [cooperativeId], references: [id], onDelete: Cascade)
+  assignedMember     Member?      @relation("AssignedMemberTasks", fields: [assignedToMemberId], references: [id])
+  createdByUser      User         @relation("CreatedTasks", fields: [createdByUserId], references: [id])
+}
+
+model AttendanceRecord {
+  id                 String       @id @default(uuid())
+  cooperativeId      String
+  memberId           String
+  date               String       // YYYY-MM-DD format for fast querying
+  status             String       @default("PRESENT") // PRESENT, ABSENT, LATE, HALF_DAY, EXCUSED
+  checkInTime        DateTime?
+  checkOutTime       DateTime?
+  verificationMethod String       @default("MANUAL") // MANUAL, BIOMETRIC_DEVICE, RFID, MOBILE_APP
+  deviceId           String?
+  notes              String?
+
+  cooperative        Cooperative  @relation(fields: [cooperativeId], references: [id], onDelete: Cascade)
+  member             Member       @relation(fields: [memberId], references: [id], onDelete: Cascade)
+  device             HardwareDevice? @relation(fields: [deviceId], references: [id])
+
+  @@unique([cooperativeId, memberId, date])
+}
+
+model Meeting {
+  id             String          @id @default(uuid())
+  cooperativeId  String
+  title          String
+  description    String?
+  agenda         String?
+  meetingDate    DateTime
+  locationOrLink String?
+  status         String          @default("SCHEDULED") // SCHEDULED, IN_PROGRESS, CONCLUDED, CANCELLED
+
+  cooperative    Cooperative     @relation(fields: [cooperativeId], references: [id], onDelete: Cascade)
+  minutes        MeetingMinutes?
+}
+
+model MeetingMinutes {
+  id              String   @id @default(uuid())
+  meetingId       String   @unique
+  minutesContent  String
+  actionItemsJson String?  // JSON array
+  decisionsJson   String?  // JSON array
+  attendanceCount Int      @default(0)
+  recordedAt      DateTime @default(now())
+
+  meeting         Meeting  @relation(fields: [meetingId], references: [id], onDelete: Cascade)
+}
+
+model FinancialRecord {
+  id               String       @id @default(uuid())
+  cooperativeId    String
+  type             String       // INCOME, EXPENSE
+  category         String       // MEMBERSHIP_FEE, SALES, GRANTS, OPERATIONS, SALARIES, PROCUREMENT, EQUIPMENT
+  amount           Float
+  description      String
+  transactionDate  DateTime     @default(now())
+  referenceNumber  String?
+  recordedByUserId String
+  receiptUrl       String?
+  isApproved       Boolean      @default(true)
+
+  cooperative      Cooperative  @relation(fields: [cooperativeId], references: [id], onDelete: Cascade)
+  recordedByUser   User         @relation("RecordedFinancials", fields: [recordedByUserId], references: [id])
+}
+
+model Document {
+  id               String       @id @default(uuid())
+  cooperativeId    String
+  title            String
+  category         String       @default("OTHER") // POLICY, LEGAL, FINANCIAL, REPORT, MINUTES, OTHER
+  fileUrl          String
+  fileType         String?
+  fileSize         Int?
+  uploadedByUserId String
+  isConfidential   Boolean      @default(false)
+  createdAt        DateTime     @default(now())
+
+  cooperative      Cooperative  @relation(fields: [cooperativeId], references: [id], onDelete: Cascade)
+  uploadedByUser   User         @relation("UploadedDocs", fields: [uploadedByUserId], references: [id])
+}
+
+model HardwareDevice {
+  id               String             @id @default(uuid())
+  deviceIdentifier String             @unique // Device MAC or Serial UUID
+  name             String
+  type             String             @default("BIOMETRIC_FINGERPRINT") // BIOMETRIC_FINGERPRINT, RFID_SCANNER, FACIAL_RECOGNITION, IOT_GATEWAY
+  cooperativeId    String
+  location         String?
+  lastSyncAt       DateTime?
+  status           String             @default("ONLINE") // ONLINE, OFFLINE, MAINTENANCE
+  apiKeyHash       String?
+
+  cooperative      Cooperative        @relation(fields: [cooperativeId], references: [id], onDelete: Cascade)
+  attendanceLogs   AttendanceRecord[]
+}
+
+// ==========================================
+// 4. EMPLOYMENT ECOSYSTEM
+// ==========================================
+
+model CandidateProfile {
+  id               String             @id @default(uuid())
+  userId           String             @unique
+  headline         String?
+  bio              String?
+  experienceYears  Int                @default(0)
+  educationLevel   String?            // DIPLOMA, BACHELORS, MASTERS, SECONDARY
+  currentCity      String?
+  resumeUrl        String?
+  portfolioUrl     String?
+  careerPreferences String?           // Stored as JSON or comma-separated
+  isPublic         Boolean            @default(true)
+  createdAt        DateTime           @default(now())
+  updatedAt        DateTime           @updatedAt
+
+  user             User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  candidateSkills  CandidateSkill[]
+  applications     JobApplication[]
+  recommendations  JobRecommendation[]
+}
+
+model CandidateSkill {
+  id                 String           @id @default(uuid())
+  candidateProfileId String
+  skillId            String
+  proficiency        String           @default("INTERMEDIATE") // BEGINNER, INTERMEDIATE, EXPERT
+  isVerified         Boolean          @default(false) // TRUE if verified via HEXORA LMS course completion!
+  sourceCourseId     String?
+  verifiedAt         DateTime?
+
+  candidateProfile   CandidateProfile @relation(fields: [candidateProfileId], references: [id], onDelete: Cascade)
+  skill              Skill            @relation(fields: [skillId], references: [id], onDelete: Cascade)
+
+  @@unique([candidateProfileId, skillId])
+}
+
+model Employer {
+  id             String        @id @default(uuid())
+  userId         String        @unique
+  companyName    String
+  industry       String        @default("AGRICULTURE_AND_ALLIED")
+  companySize    String        @default("1-50")
+  website        String?
+  description    String?
+  logoUrl        String?
+  verifiedStatus String        @default("VERIFIED") // PENDING, VERIFIED
+
+  user           User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  jobPostings    JobPosting[]
+}
+
+model JobPosting {
+  id                  String             @id @default(uuid())
+  employerId          String
+  title               String
+  description         String
+  requirements        String?
+  employmentType      String             @default("FULL_TIME") // FULL_TIME, PART_TIME, CONTRACT, INTERNSHIP, REMOTE
+  experienceYears     Int                @default(0)
+  location            String
+  salaryRange         String?
+  applicationDeadline DateTime?
+  status              String             @default("ACTIVE") // ACTIVE, CLOSED, DRAFT
+  createdAt           DateTime           @default(now())
+  updatedAt           DateTime           @updatedAt
+
+  employer            Employer           @relation(fields: [employerId], references: [id], onDelete: Cascade)
+  jobSkills           JobSkill[]
+  applications        JobApplication[]
+  recommendations     JobRecommendation[]
+}
+
+model JobSkill {
+  id           String     @id @default(uuid())
+  jobPostingId String
+  skillId      String
+  isMandatory  Boolean    @default(true)
+
+  jobPosting   JobPosting @relation(fields: [jobPostingId], references: [id], onDelete: Cascade)
+  skill        Skill      @relation(fields: [skillId], references: [id], onDelete: Cascade)
+
+  @@unique([jobPostingId, skillId])
+}
+
+model JobApplication {
+  id                 String           @id @default(uuid())
+  jobPostingId       String
+  candidateProfileId String
+  coverLetter        String?
+  resumeUrl          String?
+  status             String           @default("APPLIED") // APPLIED, UNDER_REVIEW, SHORTLISTED, INTERVIEW, SELECTED, REJECTED
+  employerNotes      String?
+  appliedAt          DateTime         @default(now())
+  updatedAt          DateTime         @updatedAt
+
+  jobPosting         JobPosting       @relation(fields: [jobPostingId], references: [id], onDelete: Cascade)
+  candidateProfile   CandidateProfile @relation(fields: [candidateProfileId], references: [id], onDelete: Cascade)
+
+  @@unique([jobPostingId, candidateProfileId])
+}
+
+model JobRecommendation {
+  id                 String           @id @default(uuid())
+  candidateProfileId String
+  jobPostingId       String
+  matchScore         Int              // 0 - 100 percentage
+  matchingReasonsJson String          // JSON array of reasons
+  generatedAt        DateTime         @default(now())
+
+  candidateProfile   CandidateProfile @relation(fields: [candidateProfileId], references: [id], onDelete: Cascade)
+  jobPosting         JobPosting       @relation(fields: [jobPostingId], references: [id], onDelete: Cascade)
+
+  @@unique([candidateProfileId, jobPostingId])
+}
+
+// ==========================================
+// 5. CROSS-MODULE WORKFLOWS & AI INTELLIGENCE
+// ==========================================
+
+model CooperativeTrainingAssignment {
+  id               String      @id @default(uuid())
+  cooperativeId    String
+  memberId         String
+  courseId         String
+  assignedByUserId String
+  assignedAt       DateTime    @default(now())
+  dueDate          DateTime?
+  completionStatus String      @default("ASSIGNED") // ASSIGNED, IN_PROGRESS, COMPLETED
+
+  cooperative      Cooperative @relation(fields: [cooperativeId], references: [id], onDelete: Cascade)
+  member           Member      @relation(fields: [memberId], references: [id], onDelete: Cascade)
+  course           Course      @relation(fields: [courseId], references: [id], onDelete: Cascade)
+
+  @@unique([cooperativeId, memberId, courseId])
+}
+
+model AIInteraction {
+  id        String   @id @default(uuid())
+  userId    String?
+  workspace String   @default("LMS") // LMS, ERP, EMPLOYMENT
+  feature   String   // CHATBOT, SKILL_GAP, JOB_MATCH, RESUME_TIPS, COOP_INSIGHTS
+  prompt    String
+  response  String
+  createdAt DateTime @default(now())
+
+  user      User?    @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
