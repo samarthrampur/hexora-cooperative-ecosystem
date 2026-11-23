@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { api } from '../../services/api';
+import { api, getAssetUrl } from '../../services/api';
 import { DocumentRecord } from '../../types';
 import { FileText, Download, ShieldCheck, Lock, Upload, Plus } from 'lucide-react';
 
@@ -69,7 +69,7 @@ export const DocumentArchive: React.FC = () => {
               </div>
 
               <a
-                href={d.fileUrl}
+                href={getAssetUrl(d.fileUrl)}
                 target="_blank"
                 rel="noreferrer"
                 className="p-2 text-slate-500 hover:text-blue-700 hover:bg-blue-50 rounded-lg transition-colors"

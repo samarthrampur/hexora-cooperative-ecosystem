@@ -1,6 +1,17 @@
 // Centralized API Client for HEXORA Ecosystem
 
-const API_BASE = '/api';
+// Cloud-ready API base URL configuration:
+// Uses import.meta.env.VITE_API_URL or defaults to local backend port 5000
+const rawBase = (import.meta.env.VITE_API_URL || 'http://localhost:5000').replace(/\/+$/, '');
+const API_BASE = rawBase.endsWith('/api') ? rawBase : `${rawBase}/api`;
+
+export const getAssetUrl = (path: string): string => {
+  if (!path) return '';
+  if (path.startsWith('http://') || path.startsWith('https://')) return path;
+  const cleanPath = path.startsWith('/') ? path : `/${path}`;
+  const origin = API_BASE.endsWith('/api') ? API_BASE.slice(0, -4) : API_BASE;
+  return `${origin}${cleanPath}`;
+};
 
 class ApiService {
   private getHeaders(): HeadersInit {
