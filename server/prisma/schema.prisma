@@ -605,3 +605,15 @@ model AIInteraction {
 
   user      User?    @relation(fields: [userId], references: [id], onDelete: Cascade)
 }
+
+model OtpVerification {
+  id        String   @id @default(uuid())
+  channel   String   // "EMAIL" or "PHONE"
+  contact   String   // normalized email or mobile number (e.g. +919876543210)
+  code      String
+  expiresAt DateTime
+  verified  Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@unique([channel, contact])
+}

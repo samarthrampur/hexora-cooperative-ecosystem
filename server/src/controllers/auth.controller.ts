@@ -1,6 +1,8 @@
 import { Request, Response } from 'express';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
+import crypto from 'crypto';
+import nodemailer from 'nodemailer';
 import prisma from '../prisma/client';
 import { AuthenticatedRequest } from '../middleware/auth';
 
@@ -9,27 +11,241 @@ const generateToken = (userId: string): string => {
   return jwt.sign({ userId }, secret, { expiresIn: '7d' });
 };
 
+const normalizeContact = (channel: 'EMAIL' | 'PHONE', contact: string): string => {
+  if (channel === 'EMAIL') {
+    return contact.trim().toLowerCase();
+  }
+  const digits = contact.replace(/\D/g, '');
+  if (digits.length === 10) return `+91${digits}`;
+  if (digits.length === 12 && digits.startsWith('91')) return `+${digits}`;
+  return contact.trim();
+};
+
+
+export const sendOtp = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { channel, contact } = req.body as { channel?: 'EMAIL' | 'PHONE'; contact?: string };
+
+    if (!channel || !['EMAIL', 'PHONE'].includes(channel) || !contact?.trim()) {
+      res.status(400).json({ error: 'Channel (EMAIL or PHONE) and contact are required.' });
+      return;
+    }
+
+    const normalized = normalizeContact(channel, contact);
+
+    if (channel === 'EMAIL') {
+      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+      if (!emailRegex.test(normalized)) {
+        res.status(400).json({ error: 'Please enter a valid email address.' });
+        return;
+      }
+
+      const existingUser = await prisma.user.findUnique({ where: { email: normalized } });
+      if (existingUser) {
+        res.status(400).json({ error: 'An account with this email already exists.' });
+        return;
+      }
+    } else {
+      const digitsOnly = normalized.replace(/\D/g, '');
+      if (digitsOnly.length < 10 || digitsOnly.length > 15) {
+        res.status(400).json({ error: 'Please enter a valid mobile number.' });
+        return;
+      }
+    }
+
+    const code = crypto.randomInt(100000, 999999).toString();
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
+
+    await prisma.otpVerification.upsert({
+      where: {
+        channel_contact: {
+          channel,
+          contact: normalized,
+        },
+      },
+      update: {
+        code,
+        expiresAt,
+        verified: false,
+      },
+      create: {
+        channel,
+        contact: normalized,
+        code,
+        expiresAt,
+        verified: false,
+      },
+    });
+
+    if (channel === 'EMAIL') {
+      const apiKey = process.env.BREVO_API_KEY?.trim();
+      const senderEmail = (process.env.BREVO_SENDER_EMAIL || process.env.EMAIL_USER)?.trim();
+
+      if (!apiKey || !senderEmail) {
+        res.status(500).json({ error: 'Brevo email credentials are missing in server/.env.' });
+        return;
+      }
+
+      const response = await fetch('https://api.brevo.com/v3/smtp/email', {
+        method: 'POST',
+        headers: {
+          accept: 'application/json',
+          'api-key': apiKey,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          sender: { name: 'HEXORA Ecosystem', email: senderEmail },
+          to: [{ email: normalized }],
+          subject: 'Your HEXORA Email Verification OTP',
+          htmlContent: `
+            <div style="font-family: Arial, sans-serif; max-width: 480px; margin: 0 auto; padding: 24px; border: 1px solid #e2e8f0; border-radius: 12px;">
+              <h2 style="color: #0f172a; margin-bottom: 8px;">Verify Your HEXORA Email</h2>
+              <p style="color: #475569; font-size: 14px;">Use the 6-digit verification code below to complete your HEXORA registration. This code expires in 10 minutes.</p>
+              <div style="margin: 20px 0; padding: 14px; background: #f0fdfa; border: 1px solid #99f6e4; border-radius: 8px; text-align: center; font-size: 28px; font-weight: 800; letter-spacing: 6px; color: #0f766e;">
+                ${code}
+              </div>
+              <p style="color: #94a3b8; font-size: 12px;">If you did not request this code, you can safely ignore this email.</p>
+            </div>
+          `,
+        }),
+      });
+
+      if (!response.ok) {
+        const errData: any = await response.json().catch(() => ({}));
+        throw new Error(errData.message || 'Brevo failed to send verification email.');
+      }
+
+      res.json({ message: `Verification OTP sent to ${normalized}.` });
+      return;
+    }
+
+    // PHONE channel: send via configured SMS gateway if present, otherwise use dev fallback
+    if (process.env.SMS_PROVIDER_URL && process.env.SMS_API_KEY) {
+      const smsResponse = await fetch(process.env.SMS_PROVIDER_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${process.env.SMS_API_KEY}`,
+        },
+        body: JSON.stringify({
+          to: normalized,
+          sender: process.env.SMS_SENDER_ID || 'HEXORA',
+          message: `Your HEXORA verification OTP is ${code}. Valid for 10 minutes.`,
+        }),
+      });
+
+      if (!smsResponse.ok) {
+        throw new Error('Failed to dispatch SMS OTP from provider.');
+      }
+
+      res.json({ message: `Verification OTP sent to ${normalized}.` });
+      return;
+    }
+
+    console.log(`[DEV SMS OTP] ${normalized} -> ${code}`);
+    res.json({
+      message: `Phone OTP generated for ${normalized}.`,
+      devOtp: code,
+    });
+  } catch (error: any) {
+    console.error('Send OTP Error:', error);
+    res.status(500).json({ error: error.message || 'Failed to send verification OTP.' });
+  }
+};
+
+export const verifyOtp = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { channel, contact, code } = req.body as {
+      channel?: 'EMAIL' | 'PHONE';
+      contact?: string;
+      code?: string;
+    };
+
+    if (!channel || !['EMAIL', 'PHONE'].includes(channel) || !contact?.trim() || !code?.trim()) {
+      res.status(400).json({ error: 'Channel, contact, and 6-digit OTP code are required.' });
+      return;
+    }
+
+    const normalized = normalizeContact(channel, contact);
+
+    const record = await prisma.otpVerification.findUnique({
+      where: {
+        channel_contact: {
+          channel,
+          contact: normalized,
+        },
+      },
+    });
+
+    if (!record) {
+      res.status(400).json({ error: `Please request a ${channel.toLowerCase()} OTP first.` });
+      return;
+    }
+
+    if (new Date() > record.expiresAt) {
+      res.status(400).json({ error: 'This OTP has expired. Please request a new one.' });
+      return;
+    }
+
+    if (record.code !== code.trim()) {
+      res.status(400).json({ error: 'Invalid OTP code. Please check and try again.' });
+      return;
+    }
+
+    await prisma.otpVerification.update({
+      where: { id: record.id },
+      data: { verified: true },
+    });
+
+    res.json({ message: `${channel === 'EMAIL' ? 'Email' : 'Mobile number'} verified successfully.` });
+  } catch (error: any) {
+    console.error('Verify OTP Error:', error);
+    res.status(500).json({ error: error.message || 'Failed to verify OTP.' });
+  }
+};
+
 export const register = async (req: Request, res: Response): Promise<void> => {
   try {
     const { fullName, email, password, phone, intendedRole } = req.body;
 
-    if (!fullName || !email || !password) {
-      res.status(400).json({ error: 'Full name, email, and password are required.' });
+    if (!fullName || !email || !password || !phone) {
+      res.status(400).json({ error: 'Full name, email, mobile number, and password are required.' });
       return;
     }
 
-    const existingUser = await prisma.user.findUnique({ where: { email: email.toLowerCase() } });
+    const normalizedEmail = normalizeContact('EMAIL', email);
+    const normalizedPhone = normalizeContact('PHONE', phone);
+
+    const existingUser = await prisma.user.findUnique({ where: { email: normalizedEmail } });
     if (existingUser) {
       res.status(400).json({ error: 'An account with this email already exists.' });
+      return;
+    }
+
+    // Confirm both Email OTP and Phone OTP are verified and unexpired
+    const [emailOtpRecord, phoneOtpRecord] = await Promise.all([
+      prisma.otpVerification.findUnique({
+        where: { channel_contact: { channel: 'EMAIL', contact: normalizedEmail } },
+      }),
+      prisma.otpVerification.findUnique({
+        where: { channel_contact: { channel: 'PHONE', contact: normalizedPhone } },
+      }),
+    ]);
+
+    const now = new Date();
+    if (!emailOtpRecord || !emailOtpRecord.verified || now > emailOtpRecord.expiresAt) {
+      res.status(400).json({ error: 'Please verify your email address with OTP before registering.' });
+      return;
+    }
+
+    if (!phoneOtpRecord || !phoneOtpRecord.verified || now > phoneOtpRecord.expiresAt) {
+      res.status(400).json({ error: 'Please verify your mobile number with OTP before registering.' });
       return;
     }
 
     const passwordHash = await bcrypt.hash(password, 10);
     const validRole = intendedRole || 'LEARNER';
 
-    // Determine initial workspace permissions based on role
-    // Everyone gets LMS for capacity building.
-    // ERP admins and members get ERP. Job seekers and employers get Employment.
     const initialWorkspaces: ('LMS' | 'ERP' | 'EMPLOYMENT')[] = ['LMS'];
     if (['COOPERATIVE_ADMIN', 'COOPERATIVE_MEMBER', 'SUPER_ADMIN'].includes(validRole)) {
       initialWorkspaces.push('ERP');
@@ -38,21 +254,19 @@ export const register = async (req: Request, res: Response): Promise<void> => {
       initialWorkspaces.push('EMPLOYMENT');
     }
 
-    // Create user in transaction
     const newUser = await prisma.$transaction(async (tx) => {
       const user = await tx.user.create({
         data: {
           fullName,
-          email: email.toLowerCase(),
+          email: normalizedEmail,
           passwordHash,
-          phone: phone || null,
+          phone: normalizedPhone,
           intendedRole: validRole,
           activeWorkspace: validRole.includes('COOPERATIVE') ? 'ERP' : validRole === 'EMPLOYER' ? 'EMPLOYMENT' : 'LMS',
-          hasSelectedPurpose: false, // New users will encounter the Purpose Selection screen!
+          hasSelectedPurpose: false,
         },
       });
 
-      // Find or create role
       let roleRecord = await tx.role.findUnique({ where: { name: validRole } });
       if (!roleRecord) {
         roleRecord = await tx.role.create({
@@ -60,7 +274,6 @@ export const register = async (req: Request, res: Response): Promise<void> => {
         });
       }
 
-      // Assign UserRole
       await tx.userRole.create({
         data: {
           userId: user.id,
@@ -68,7 +281,6 @@ export const register = async (req: Request, res: Response): Promise<void> => {
         },
       });
 
-      // Grant initial workspace access records
       for (const ws of Array.from(new Set(initialWorkspaces))) {
         await tx.workspaceAccess.create({
           data: {
@@ -78,7 +290,6 @@ export const register = async (req: Request, res: Response): Promise<void> => {
         });
       }
 
-      // If registered as Job Seeker or Learner, initialize Candidate Profile
       if (['JOB_SEEKER', 'LEARNER'].includes(validRole)) {
         await tx.candidateProfile.create({
           data: {
@@ -89,7 +300,6 @@ export const register = async (req: Request, res: Response): Promise<void> => {
         });
       }
 
-      // Send initial welcome notification
       await tx.notification.create({
         data: {
           userId: user.id,
@@ -99,10 +309,19 @@ export const register = async (req: Request, res: Response): Promise<void> => {
         },
       });
 
+      // Clean up consumed OTP records
+      await tx.otpVerification.deleteMany({
+        where: {
+          OR: [
+            { channel: 'EMAIL', contact: normalizedEmail },
+            { channel: 'PHONE', contact: normalizedPhone },
+          ],
+        },
+      });
+
       return user;
     });
 
-    // Fetch complete user with roles
     const completeUser = await prisma.user.findUnique({
       where: { id: newUser.id },
       include: {
@@ -216,7 +435,6 @@ export const selectWorkspace = async (req: AuthenticatedRequest, res: Response):
       return;
     }
 
-    // Check authorization
     const hasAccess = req.user.workspaceAccess.some(
       (w: any) => w.workspace === workspace
     );
@@ -225,8 +443,6 @@ export const selectWorkspace = async (req: AuthenticatedRequest, res: Response):
     );
 
     if (!hasAccess && !isSuperAdmin) {
-      // Auto-grant or check permission policy
-      // If a learner or member wants employment or LMS, we can grant access
       if (['LMS', 'EMPLOYMENT'].includes(workspace)) {
         await prisma.workspaceAccess.upsert({
           where: { userId_workspace: { userId, workspace } },
@@ -242,7 +458,6 @@ export const selectWorkspace = async (req: AuthenticatedRequest, res: Response):
       }
     }
 
-    // Update active workspace and mark purpose selected
     const updated = await prisma.user.update({
       where: { id: userId },
       data: {
@@ -275,7 +490,6 @@ export const selectWorkspace = async (req: AuthenticatedRequest, res: Response):
 
 export const forgotPassword = async (req: Request, res: Response): Promise<void> => {
   const { email } = req.body;
-  // Demo safe forgot password
   res.json({
     message: `If an account with ${email} exists, a password reset link has been dispatched to your inbox.`,
   });
