@@ -1,5 +1,11 @@
-import React, { useState } from 'react';
+import React, { useState, useRef } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
+import {
+  RecaptchaVerifier,
+  signInWithPhoneNumber,
+  ConfirmationResult,
+} from 'firebase/auth';
+import { firebaseAuth } from '../../lib/firebase';
 import { useAuth } from '../../context/AuthContext';
 import { api } from '../../services/api';
 import { UserRoleType } from '../../types';
@@ -18,6 +24,12 @@ import {
   KeyRound,
 } from 'lucide-react';
 
+declare global {
+  interface Window {
+    recaptchaVerifier?: RecaptchaVerifier;
+  }
+}
+
 export const RegisterPage: React.FC = () => {
   const navigate = useNavigate();
   const { register } = useAuth();
@@ -31,18 +43,19 @@ export const RegisterPage: React.FC = () => {
     intendedRole: 'LEARNER' as UserRoleType,
   });
 
-  // Email OTP state
+  // Email OTP state (Brevo backend)
   const [emailOtp, setEmailOtp] = useState('');
   const [emailOtpSent, setEmailOtpSent] = useState(false);
   const [emailVerified, setEmailVerified] = useState(false);
   const [emailOtpLoading, setEmailOtpLoading] = useState(false);
 
-  // Phone OTP state
+  // Phone OTP state (Firebase Phone Auth)
   const [phoneOtp, setPhoneOtp] = useState('');
   const [phoneOtpSent, setPhoneOtpSent] = useState(false);
   const [phoneVerified, setPhoneVerified] = useState(false);
   const [phoneOtpLoading, setPhoneOtpLoading] = useState(false);
-  const [devPhoneOtpHint, setDevPhoneOtpHint] = useState<string | null>(null);
+  const [confirmationResult, setConfirmationResult] = useState<ConfirmationResult | null>(null);
+  const recaptchaContainerRef = useRef<HTMLDivElement | null>(null);
 
   const [error, setError] = useState<string | null>(null);
   const [infoMessage, setInfoMessage] = useState<string | null>(null);
@@ -56,6 +69,35 @@ export const RegisterPage: React.FC = () => {
     { value: 'JOB_SEEKER', label: 'Job Seeker', desc: 'Discover jobs matching certified skills', icon: Briefcase },
     { value: 'EMPLOYER', label: 'Employer / Recruiter', desc: 'Post vacancies & evaluate skilled talent', icon: Building2 },
   ];
+
+  const formatIndianE164 = (rawPhone: string): string | null => {
+    const trimmed = rawPhone.trim();
+    const digitsOnly = trimmed.replace(/\D/g, '');
+    if (trimmed.startsWith('+') && digitsOnly.length >= 10 && digitsOnly.length <= 15) {
+      return `+${digitsOnly}`;
+    }
+    if (digitsOnly.length === 10) {
+      return `+91${digitsOnly}`;
+    }
+    if (digitsOnly.length === 12 && digitsOnly.startsWith('91')) {
+      return `+${digitsOnly}`;
+    }
+    return null;
+  };
+
+  const resetRecaptcha = () => {
+    if (window.recaptchaVerifier) {
+      try {
+        window.recaptchaVerifier.clear();
+      } catch {
+        // Ignore cleanup errors if widget was already removed
+      }
+      window.recaptchaVerifier = undefined;
+    }
+    if (recaptchaContainerRef.current) {
+      recaptchaContainerRef.current.innerHTML = '';
+    }
+  };
 
   const handleSendEmailOtp = async () => {
     setError(null);
@@ -108,23 +150,40 @@ export const RegisterPage: React.FC = () => {
   const handleSendPhoneOtp = async () => {
     setError(null);
     setInfoMessage(null);
-    if (!formData.phone.trim()) {
-      setError('Please enter your mobile number first.');
+
+    const e164Phone = formatIndianE164(formData.phone);
+    if (!e164Phone) {
+      setError('Please enter a valid 10-digit mobile number (e.g. +91 98765 43210).');
       return;
     }
 
     try {
       setPhoneOtpLoading(true);
-      const res = await api.post<{ message: string; devOtp?: string }>('/auth/send-otp', {
-        channel: 'PHONE',
-        contact: formData.phone,
+      resetRecaptcha();
+
+      const verifier = new RecaptchaVerifier(firebaseAuth, 'recaptcha-container', {
+        size: 'invisible',
       });
+      window.recaptchaVerifier = verifier;
+
+      const result = await signInWithPhoneNumber(firebaseAuth, e164Phone, verifier);
+      setConfirmationResult(result);
       setPhoneOtpSent(true);
       setPhoneVerified(false);
-      setDevPhoneOtpHint(res.devOtp || null);
-      setInfoMessage(res.message || 'Verification OTP sent to your mobile number.');
+      setPhoneOtp('');
+      setInfoMessage(`Verification SMS sent to ${e164Phone}.`);
     } catch (err: any) {
-      setError(err.message || 'Failed to send mobile OTP.');
+      resetRecaptcha();
+      const code = err?.code || '';
+      if (code === 'auth/too-many-requests') {
+        setError('Too many SMS attempts. Please wait a bit before trying again.');
+      } else if (code === 'auth/invalid-phone-number') {
+        setError('Invalid phone number format. Include country code (e.g. +91).');
+      } else if (code === 'auth/operation-not-allowed') {
+        setError('Phone Auth or +91 SMS region is not enabled yet in Firebase Console.');
+      } else {
+        setError(err?.message || 'Failed to send mobile SMS OTP.');
+      }
     } finally {
       setPhoneOtpLoading(false);
     }
@@ -133,23 +192,32 @@ export const RegisterPage: React.FC = () => {
   const handleVerifyPhoneOtp = async () => {
     setError(null);
     setInfoMessage(null);
-    if (!phoneOtp.trim()) {
+
+    if (phoneOtp.trim().length !== 6) {
       setError('Enter the 6-digit OTP sent to your mobile number.');
+      return;
+    }
+
+    if (!confirmationResult) {
+      setError('Please click Send OTP first to request an SMS code.');
       return;
     }
 
     try {
       setPhoneOtpLoading(true);
-      const res = await api.post<{ message: string }>('/auth/verify-otp', {
-        channel: 'PHONE',
-        contact: formData.phone,
-        code: phoneOtp,
-      });
+      await confirmationResult.confirm(phoneOtp.trim());
       setPhoneVerified(true);
-      setDevPhoneOtpHint(null);
-      setInfoMessage(res.message || 'Mobile number verified successfully.');
+      resetRecaptcha();
+      setInfoMessage('Mobile number verified successfully.');
     } catch (err: any) {
-      setError(err.message || 'Invalid mobile OTP.');
+      const code = err?.code || '';
+      if (code === 'auth/invalid-verification-code') {
+        setError('Incorrect SMS OTP code. Please check and try again.');
+      } else if (code === 'auth/code-expired') {
+        setError('SMS OTP has expired. Click Resend OTP for a new code.');
+      } else {
+        setError(err?.message || 'Failed to verify mobile OTP.');
+      }
     } finally {
       setPhoneOtpLoading(false);
     }
@@ -223,11 +291,6 @@ export const RegisterPage: React.FC = () => {
           {infoMessage && (
             <div className="mb-4 p-3 rounded-xl bg-teal-50 border border-teal-200 text-teal-800 text-xs font-semibold">
               {infoMessage}
-              {devPhoneOtpHint && (
-                <span className="block mt-1 font-mono text-teal-950">
-                  Dev SMS OTP: <strong>{devPhoneOtpHint}</strong>
-                </span>
-              )}
             </div>
           )}
 
@@ -320,7 +383,7 @@ export const RegisterPage: React.FC = () => {
               )}
             </div>
 
-            {/* Mobile Number + OTP Verification */}
+            {/* Mobile Number + Firebase SMS OTP Verification */}
             <div>
               <label className="block text-xs font-bold uppercase tracking-wider text-slate-700 mb-1">
                 Mobile Number *
@@ -339,6 +402,7 @@ export const RegisterPage: React.FC = () => {
                       setFormData({ ...formData, phone: e.target.value });
                       setPhoneOtpSent(false);
                       setPhoneVerified(false);
+                      setConfirmationResult(null);
                     }}
                     placeholder="+91 98765 43210"
                     className="block w-full pl-9 pr-3 py-2 border border-slate-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-teal-500 disabled:bg-slate-100"
@@ -386,6 +450,9 @@ export const RegisterPage: React.FC = () => {
                   </button>
                 </div>
               )}
+
+              {/* Invisible reCAPTCHA mount target for Firebase Phone Auth */}
+              <div id="recaptcha-container" ref={recaptchaContainerRef} />
             </div>
 
             {/* Passwords */}

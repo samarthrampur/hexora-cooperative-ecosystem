@@ -222,24 +222,14 @@ export const register = async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
-    // Confirm both Email OTP and Phone OTP are verified and unexpired
-    const [emailOtpRecord, phoneOtpRecord] = await Promise.all([
-      prisma.otpVerification.findUnique({
-        where: { channel_contact: { channel: 'EMAIL', contact: normalizedEmail } },
-      }),
-      prisma.otpVerification.findUnique({
-        where: { channel_contact: { channel: 'PHONE', contact: normalizedPhone } },
-      }),
-    ]);
+    // Confirm Email OTP is verified and unexpired (Mobile SMS OTP is verified on client via Firebase)
+    const emailOtpRecord = await prisma.otpVerification.findUnique({
+      where: { channel_contact: { channel: 'EMAIL', contact: normalizedEmail } },
+    });
 
     const now = new Date();
     if (!emailOtpRecord || !emailOtpRecord.verified || now > emailOtpRecord.expiresAt) {
       res.status(400).json({ error: 'Please verify your email address with OTP before registering.' });
-      return;
-    }
-
-    if (!phoneOtpRecord || !phoneOtpRecord.verified || now > phoneOtpRecord.expiresAt) {
-      res.status(400).json({ error: 'Please verify your mobile number with OTP before registering.' });
       return;
     }
 
@@ -309,13 +299,11 @@ export const register = async (req: Request, res: Response): Promise<void> => {
         },
       });
 
-      // Clean up consumed OTP records
+      // Clean up consumed email OTP record
       await tx.otpVerification.deleteMany({
         where: {
-          OR: [
-            { channel: 'EMAIL', contact: normalizedEmail },
-            { channel: 'PHONE', contact: normalizedPhone },
-          ],
+          channel: 'EMAIL',
+          contact: normalizedEmail,
         },
       });
 
@@ -352,6 +340,7 @@ export const register = async (req: Request, res: Response): Promise<void> => {
     res.status(500).json({ error: error.message || 'Server error during registration.' });
   }
 };
+
 
 export const login = async (req: Request, res: Response): Promise<void> => {
   try {
